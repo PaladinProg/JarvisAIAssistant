@@ -361,3 +361,16 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Скомпилированные бинарники
+[Bb]in/
+[Oo]bj/
+
+# Тяжёлые модели нейросетей (не должны быть в Git!)
+*.bin
+*.onnx
+*.onnx.json
+
+# Папки с моделями и утилитами
+/Models/
+/tools/piper/
