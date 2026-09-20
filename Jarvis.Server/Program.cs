@@ -1,6 +1,7 @@
 ﻿using Jarvis.Core;
 using Jarvis.Core.Routing;
-using Jarvis.Server.Services; // Не забудь добавить using для VoiceService
+using Jarvis.Server;
+using Jarvis.Core.Services; // Не забудь добавить using для VoiceService
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -20,6 +21,7 @@ var router = app.Services.GetRequiredService<SmartRouter>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var config = app.Services.GetRequiredService<IConfiguration>(); // <-- Исправление ошибки CS1061
 var voiceLogger = app.Services.GetRequiredService<ILogger<VoiceService>>(); // <-- Исправление ошибки CS1503
+var history = app.Services.GetRequiredService<ConversationHistory>();
 
 Console.WriteLine("Джарвис запущен!");
 Console.WriteLine("Выберите режим:");
@@ -35,7 +37,7 @@ if (choice == "2")
     {
         // Запускаем голосовой сервис
         // Теперь передаем правильные зависимости
-        using var voiceService = new VoiceService(router, voiceLogger, config);
+        using var voiceService = new VoiceService(router, voiceLogger, config, history);
 
         // Получаем токен отмены для корректного завершения
         var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();

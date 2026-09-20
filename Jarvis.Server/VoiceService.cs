@@ -1,79 +1,148 @@
 ﻿using Jarvis.Core.Routing;
+using Jarvis.Core.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+using System;
 using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Whisper.net;
 
-namespace Jarvis.Server.Services;
+namespace Jarvis.Server;
 
 public class VoiceService : IDisposable
 {
-    private const string WHISPER_MODEL_FILE = "ggml-small-q5_1.bin";
-    private const string TTS_URL = "http://127.0.0.1:8008/tts";
-    private const string SPEAKER = "aidar"; // Мужской голос для Джарвиса (или "eugene", "kseniya")
-
     private readonly SmartRouter _router;
     private readonly ILogger<VoiceService> _logger;
-    private readonly WhisperFactory? _whisperFactory;
-    private readonly HttpClient _httpClient;
-    private Process? _sileroProcess;
-    private bool _isListening = false;
+    private readonly IConfiguration _config;
+    private readonly HttpClient _httpClient = new();
+    private readonly ConversationHistory _history;
 
-    public VoiceService(SmartRouter router, ILogger<VoiceService> logger, IConfiguration config)
+    private WhisperFactory? _whisperFactory;
+    private Process? _sileroProcess;
+    private bool _isListening;
+
+    // === ГРОМКОСТЬ РЕЧИ ДЖАРВИСА ===
+    // Значение от 0.0f (тишина) до 1.0f (максимум). 0.65f — комфортные 65%.
+    private float _volume = 0.65f;
+
+    private const string TTS_URL = "http://127.0.0.1:8008/tts";
+    private const string SPEAKER = "aidar";
+
+    public VoiceService(SmartRouter router, ILogger<VoiceService> logger, IConfiguration config, ConversationHistory history)
     {
         _router = router;
         _logger = logger;
-        _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        _config = config;
+        _history = history;
 
-        var solutionRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
-
-        // 1. Автозапуск локального сервера Silero в фоне (если он еще не запущен)
-        StartSileroServer(solutionRoot);
-
-        // 2. Инициализация модели Whisper
-        var whisperModelPath = Path.Combine(solutionRoot, "Models", WHISPER_MODEL_FILE);
-        if (File.Exists(whisperModelPath))
+        // 1. Считываем громкость из appsettings.json секции "Voice:Volume" (если есть)
+        if (float.TryParse(config["Voice:Volume"], System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out float cfgVolume))
         {
-            _whisperFactory = WhisperFactory.FromPath(whisperModelPath);
+            _volume = Math.Clamp(cfgVolume, 0.0f, 1.0f);
+        }
+
+        InitWhisper();
+        CheckOrStartSileroServer();
+    }
+
+    /// <summary>
+    /// Возможность менять громкость на лету (например, из голосовой команды «сделай потише»)
+    /// </summary>
+    public void SetVolume(float volume)
+    {
+        _volume = Math.Clamp(volume, 0.0f, 1.0f);
+        _logger.LogInformation("Громкость Джарвиса установлена на {Vol:P0}", _volume);
+    }
+
+    private void InitWhisper()
+    {
+        // Проверяем возможные места расположения модели:
+        var possiblePaths = new[]
+        {
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Models", "ggml-small-q5_1.bin"),
+        Path.Combine(Directory.GetCurrentDirectory(), "Models", "ggml-small-q5_1.bin"),
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "Models", "ggml-small-q5_1.bin"), // Папка Jarvis.Server
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "Models", "ggml-small-q5_1.bin") // Корень D:\AI\Jarvis
+    };
+
+        string? modelPath = null;
+        foreach (var p in possiblePaths)
+        {
+            var fullPath = Path.GetFullPath(p);
+            if (File.Exists(fullPath))
+            {
+                modelPath = fullPath;
+                break;
+            }
+        }
+
+        if (modelPath != null)
+        {
+            _whisperFactory = WhisperFactory.FromPath(modelPath);
+            _logger.LogInformation("Whisper успешно загружен из: {Path}", modelPath);
         }
         else
         {
-            _logger.LogError("Модель Whisper не найдена: {Path}", whisperModelPath);
+            _logger.LogWarning("Файл модели Whisper не найден ни по одному из стандартных путей.");
         }
     }
 
-    private void StartSileroServer(string solutionRoot)
+    private void CheckOrStartSileroServer()
     {
-        var scriptPath = Path.Combine(solutionRoot, "Silero", "tts_server.py");
-        if (!File.Exists(scriptPath))
+        var possibleScripts = new[]
         {
-            _logger.LogWarning("Скрипт Silero не найден: {Path}. Запустите его вручную.", scriptPath);
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Silero", "tts_server.py"),
+        Path.Combine(Directory.GetCurrentDirectory(), "Silero", "tts_server.py"),
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "Silero", "tts_server.py"), // Папка Jarvis.Server
+        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "Silero", "tts_server.py") // Корень D:\AI\Jarvis
+    };
+
+        string? scriptPath = null;
+        foreach (var p in possibleScripts)
+        {
+            var fullPath = Path.GetFullPath(p);
+            if (File.Exists(fullPath))
+            {
+                scriptPath = fullPath;
+                break;
+            }
+        }
+
+        if (scriptPath == null)
+        {
+            _logger.LogError("Скрипт Silero не найден. Проверьте расположение папки Silero.");
             return;
         }
 
         try
         {
-            // Проверяем, не запущен ли он уже
             using var testClient = new HttpClient { Timeout = TimeSpan.FromMilliseconds(500) };
             testClient.GetAsync(TTS_URL).Wait();
+            _logger.LogInformation("Silero TTS сервер уже запущен.");
         }
         catch
         {
-            // Не запущен — стартуем автоматически в фоне
-            _logger.LogInformation("Запускаю локальный сервер Silero TTS...");
+            _logger.LogInformation("Запускаю локальный сервер Silero TTS: {Path}...", scriptPath);
             _sileroProcess = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = "python",
                     Arguments = $"\"{scriptPath}\"",
+                    WorkingDirectory = Path.GetDirectoryName(scriptPath), // Важно для относительных путей в python
                     UseShellExecute = false,
                     CreateNoWindow = true
                 }
             };
             _sileroProcess.Start();
-            Thread.Sleep(2000); // Даем пару секунд на старт модели
+            Thread.Sleep(2500); // Даем 2.5 сек на прогрев Silero
         }
     }
 
@@ -101,15 +170,23 @@ public class VoiceService : IDisposable
 
                 if (text.Contains("выход", StringComparison.OrdinalIgnoreCase) ||
                     text.Contains("стоп", StringComparison.OrdinalIgnoreCase))
-                {
-                    _isListening = false;
-                    await SpeakAsync("Отключаюсь, сэр.", ct);
-                    break;
-                }
+                    {
+                        _isListening = false;
+                        await SpeakAsync("До связи, братанчик.", ct);
+                        break;
+                    }
+
+                if (text.Contains("забудь", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("сбрось контекст", StringComparison.OrdinalIgnoreCase) ||
+                    text.Contains("очисти память", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _history.Clear(); // Очищаем историю
+                        await SpeakAsync("Всё, проехали. О чём базар?", ct);
+                        continue;
+                    }
 
                 var response = await _router.AskAsync(text, ct);
                 Console.WriteLine($"Джарвис: {response}");
-
                 await SpeakAsync(response, ct);
             }
             catch (OperationCanceledException) { break; }
@@ -145,6 +222,7 @@ public class VoiceService : IDisposable
         {
             result += segment.Text + " ";
         }
+
         return result.Trim();
     }
 
@@ -152,20 +230,73 @@ public class VoiceService : IDisposable
     {
         if (string.IsNullOrWhiteSpace(text)) return;
 
+        // 1. Очищаем текст от markdown-мусора, скобок и спецсимволов перед синтезом
+        var cleanText = text
+            .Replace("*", "")
+            .Replace("#", "")
+            .Replace("`", "")
+            .Replace("\"", "")
+            .Replace("(", "")
+            .Replace(")", "");
+
+        // 2. Разбиваем длинный текст на предложения
+        var sentences = cleanText.Split(new[] { '.', '!', '?', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+        var currentChunk = new StringBuilder();
+
+        foreach (var rawSentence in sentences)
+        {
+            var sentence = rawSentence.Trim();
+            if (string.IsNullOrEmpty(sentence)) continue;
+
+            // Если текущий кусок + новое предложение меньше 250 символов — копим
+            if (currentChunk.Length + sentence.Length < 250)
+            {
+                currentChunk.Append(sentence).Append(". ");
+            }
+            else
+            {
+                // Отправляем накопленный кусок в Silero
+                if (currentChunk.Length > 0)
+                {
+                    await PlayAudioChunkAsync(currentChunk.ToString().Trim(), ct);
+                    currentChunk.Clear();
+                }
+                currentChunk.Append(sentence).Append(". ");
+            }
+        }
+
+        // Доозвучиваем остаток
+        if (currentChunk.Length > 0)
+        {
+            await PlayAudioChunkAsync(currentChunk.ToString().Trim(), ct);
+        }
+    }
+
+    private async Task PlayAudioChunkAsync(string chunk, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(chunk)) return;
+
         try
         {
-            // 1. Запрашиваем WAV у локального Silero
-            var url = $"{TTS_URL}?text={Uri.EscapeDataString(text)}&speaker={SPEAKER}";
-            var wavBytes = await _httpClient.GetByteArrayAsync(url, ct);
+            var url = $"{TTS_URL}?text={Uri.EscapeDataString(chunk)}&speaker={SPEAKER}";
+            var response = await _httpClient.GetAsync(url, ct);
+            response.EnsureSuccessStatusCode();
 
-            // 2. Воспроизводим через NAudio
-            using var stream = new MemoryStream(wavBytes);
-            using var reader = new WaveFileReader(stream);
+            var audioBytes = await response.Content.ReadAsByteArrayAsync(ct);
+
+            using var ms = new MemoryStream(audioBytes);
+            using var reader = new WaveFileReader(ms);
+
+            // Применяем громкость
+            var sampleProvider = reader.ToSampleProvider();
+            var volumeProvider = new VolumeSampleProvider(sampleProvider) { Volume = _volume };
+
             using var waveOut = new WaveOutEvent();
-
-            waveOut.Init(reader);
+            waveOut.Init(volumeProvider);
             waveOut.Play();
 
+            // Ждем завершения воспроизведения кусочка
             while (waveOut.PlaybackState == PlaybackState.Playing && !ct.IsCancellationRequested)
             {
                 await Task.Delay(50, ct);
@@ -173,7 +304,7 @@ public class VoiceService : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Ошибка озвучки Silero TTS");
+            _logger.LogError(ex, "Ошибка озвучки Silero TTS для фрагмента: '{Chunk}'", chunk);
         }
     }
 
@@ -195,9 +326,9 @@ public class VoiceService : IDisposable
         DateTime recordStartTime = DateTime.Now;
 
         const double VoiceThreshold = 800.0;
-        const int SilenceTimeoutMs = 800; // Пауза после слов
-        const int MaxRecordDurationMs = 12000;//Макс время на разговорчики
-        const int NoSpeechTimeoutMs = 6000;//Если молчишь 6 сек - перезапуск
+        const int SilenceTimeoutMs = 800;    // Пауза после слов
+        const int MaxRecordDurationMs = 12000; // Макс время на фразу
+        const int NoSpeechTimeoutMs = 6000;   // Если молчишь 6 сек - перезапуск
 
         void OnDataAvailable(object? s, WaveInEventArgs e)
         {
@@ -206,7 +337,6 @@ public class VoiceService : IDisposable
                 if (isStopped) return;
 
                 ms.Write(e.Buffer, 0, e.BytesRecorded);
-
                 double rms = CalculateRms(e.Buffer, e.BytesRecorded);
                 var now = DateTime.Now;
 
@@ -252,12 +382,10 @@ public class VoiceService : IDisposable
             using (ct.Register(() => tcs.TrySetCanceled()))
             {
                 bool hasSpeech = await tcs.Task;
-
                 lock (lockObj)
                 {
                     isStopped = true;
                 }
-
                 waveIn.StopRecording();
                 waveIn.DataAvailable -= OnDataAvailable;
 
@@ -284,7 +412,6 @@ public class VoiceService : IDisposable
         }
     }
 
-    // Вспомогательный расчет среднеквадратичной громкости (RMS)
     private static double CalculateRms(byte[] buffer, int bytesRecorded)
     {
         long sum = 0;

@@ -12,35 +12,34 @@ public static class DependencyInjection
 {
     public static IServiceCollection AddJarvisCore(this IServiceCollection services, IConfiguration config)
     {
-        // 1. Регистрируем исполнителя команд
+        //Единая история диалога (память контекста)
+        services.AddSingleton<ConversationHistory>();
+
+        //Исполнитель системных команд C#
         services.AddSingleton<CommandExecutor>();
 
-        // 2. Создаем экземпляры провайдеров ВРУЧНУЮ, чтобы точно знать, кто есть кто
-        var ollamaProvider = new OllamaProvider(
+        // 3. Локальный провайдер Ollama (с памятью диалога)
+        services.AddSingleton(sp => new OllamaProvider(
             config["Ollama:BaseUrl"] ?? "http://localhost:11434",
-            config["Ollama:Model"] ?? "qwen2.5:3b"
-        );
+            config["Ollama:Model"] ?? "qwen2.5:3b",
+            sp.GetRequiredService<ConversationHistory>(),
+            sp.GetService<ILogger<OllamaProvider>>()
+        ));
 
-        var groqProvider = new GroqProvider(
-            config["Groq:ApiKey"] ?? ""
-        );
+        //Облачный провайдер OpenRouter
+        services.AddSingleton(sp => new CloudLLMProvider(
+            config["OpenRouter:ApiKey"] ?? "",
+            config["OpenRouter:Model"] ?? "deepseek/deepseek-chat:free",
+            sp.GetService<ILogger<CloudLLMProvider>>()
+        ));
 
-        // 3. Регистрируем их и как конкретные типы, и как интерфейсы (на всякий случай)
-        services.AddSingleton(ollamaProvider);
-        services.AddSingleton(groqProvider);
-
-        // Также регистрируем как ILLMProvider, если где-то в будущем понадобится полиморфизм
-        services.AddSingleton<ILLMProvider>(ollamaProvider);
-        services.AddSingleton<ILLMProvider>(groqProvider);
-
-        // 4. Регистрируем Роутер, передавая ему конкретные экземпляры
-        services.AddSingleton<SmartRouter>(sp =>
-            new SmartRouter(
-                sp.GetRequiredService<CommandExecutor>(),
-                sp.GetRequiredService<OllamaProvider>(), // Теперь контейнер знает этот тип!
-                sp.GetRequiredService<GroqProvider>(),
-                sp.GetRequiredService<ILogger<SmartRouter>>()
-            ));
+        // 5. Умный маршрутизатор (выбирает команды, локалку или облако)
+        services.AddSingleton(sp => new SmartRouter(
+            sp.GetRequiredService<CommandExecutor>(),
+            sp.GetRequiredService<OllamaProvider>(),
+            sp.GetRequiredService<CloudLLMProvider>(),
+            sp.GetRequiredService<ILogger<SmartRouter>>()
+        ));
 
         return services;
     }
