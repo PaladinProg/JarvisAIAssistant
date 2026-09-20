@@ -22,15 +22,24 @@ public class OllamaProvider : ILLMProvider
 
     public async Task<string> GenerateAsync(string prompt, CancellationToken ct = default)
     {
-        // Формируем запрос точно так, как этого ждет API Ollama
+        // Системный промпт для Джарвиса
+        const string systemPrompt =
+            "Ты — голосовой ассистент Джарвис. Твой собеседник — твой создатель (обращайся вежливо). " +
+            "Отвечай кратко, чётко и живо: максимум 1-2 коротких предложения, так как твой ответ будет озвучен вслух. " +
+            "Не используй markdown (звёздочки, решётки), списки, смайлы и спецсимволы. " +
+            "ВАЖНО: Все иностранные слова, бренды и термины пиши только русскими буквами (транскрипцией), " +
+            "например: 'Алибаба Клауд', 'Виндовс', 'Ютуб', 'Гугл', 'Пайтон', чтобы голосовой синтезатор не пропускал их.";
+
+        // Формируем запрос к Ollama с системным промптом и запросом пользователя
         var payload = new
         {
             model = _modelName,
             messages = new[]
             {
+                new { role = "system", content = systemPrompt },
                 new { role = "user", content = prompt }
             },
-            stream = false // Нам нужен полный ответ сразу
+            stream = false
         };
 
         try
